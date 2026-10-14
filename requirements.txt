@@ -1,0 +1,10 @@
+streamlit>=1.50
+plotly>=5.20
+pandas
+numpy
+pillow
+scikit-learn
+umap-learn        # optional but recommended (falls back to t-SNE)
+torch             # for the deep models
+torchvision       # only needed for the custom-model template
+transformers>=4.40

@@ -1,0 +1,8 @@
+{
+  "overall_accuracy": 100.0,
+  "synthetic_accuracy": 100.0,
+  "real_accuracy": 100.0,
+  "test_total": 1374,
+  "test_syn": 602,
+  "test_real": 772
+}
