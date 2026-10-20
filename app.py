@@ -19,7 +19,7 @@ import os
 import random
 import tempfile
 import zipfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,7 +29,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.neighbors import NearestNeighbors
@@ -60,6 +60,16 @@ class MaskRecord:
     @property
     def effective_area(self) -> float:
         return self.area if self.area else float(self.bbox[2] * self.bbox[3])
+
+
+@dataclass
+class ImageItem:
+    """One whole image in 'Whole images' mode."""
+    uid: str      # "<group>/<relative path>"
+    name: str     # file name
+    group: str    # e.g. "synthetic" / "real"
+    key: str      # file stem, used to pair images across groups
+    src: Any      # bytes (upload/demo) or file path
 
 
 def image_key(name: str) -> str:
@@ -229,6 +239,34 @@ def overlay(img: Image.Image, mask: np.ndarray, color=(255, 80, 80), alpha: floa
     return out
 
 
+_HEAT = np.array([(0, 0, 4), (40, 11, 84), (101, 21, 110), (159, 42, 99), (212, 72, 66),
+                  (245, 125, 21), (250, 193, 39), (252, 255, 164)], np.float32)   # inferno-like
+
+
+def colormap(v: np.ndarray) -> np.ndarray:
+    v = np.clip(v, 0, 1) * (len(_HEAT) - 1)
+    i = np.clip(np.floor(v).astype(int), 0, len(_HEAT) - 2)
+    t = (v - i)[..., None]
+    return _HEAT[i] * (1 - t) + _HEAT[i + 1] * t
+
+
+def heat_overlay(img: Image.Image, m: np.ndarray, vmax: float, alpha: float = 0.55,
+                 max_side: int = 900) -> Image.Image:
+    """Blend a coarse (h, w) difference map over the image (bilinear upsampling)."""
+    im = img.copy()
+    im.thumbnail((max_side, max_side))
+    W, H = im.size
+    v = Image.fromarray((np.clip(m / max(vmax, 1e-6), 0, 1) * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR)
+    v = np.asarray(v, np.float32) / 255
+    out = np.asarray(im.convert("RGB"), np.float32) * (1 - alpha) + colormap(v) * alpha
+    return Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
+
+def colorbar(width: int = 360, height: int = 12) -> Image.Image:
+    row = colormap(np.linspace(0, 1, width))
+    return Image.fromarray(np.repeat(row[None], height, 0).astype(np.uint8))
+
+
 # ############################################################################
 # EMBEDDING MODELS
 # ############################################################################
@@ -249,6 +287,10 @@ def get_device(pref: str = "auto") -> str:
 class BaseEmbedder:
     name = "base"
     supports_text = False
+    supports_spatial = False   # embed_spatial(images) -> (N, C, h, w) feature maps (difference heatmaps)
+
+    def embed_spatial(self, images: list[Image.Image]) -> np.ndarray:
+        raise NotImplementedError("This model doesn't provide spatial feature maps.")
 
     def embed(self, images: list[Image.Image]) -> np.ndarray:
         raise NotImplementedError
@@ -261,6 +303,18 @@ class BaseEmbedder:
 class QuickBaseline(BaseEmbedder):
     """Colour histogram + gradient orientations + tiny thumbnail. For smoke tests only."""
     name = "Quick test (colour + texture features)"
+    supports_spatial = True
+
+    def embed_spatial(self, images):
+        out = []
+        for im in images:
+            a = np.asarray(im.convert("RGB").resize((128, 128)), np.float32) / 255
+            g = a.mean(2)
+            gy, gx = np.gradient(g)
+            cells = lambda x: x.reshape(16, 8, 16, 8).mean((1, 3))   # noqa: E731
+            spread = lambda x: x.reshape(16, 8, 16, 8).std((1, 3))   # noqa: E731
+            out.append(np.stack([cells(a[..., c]) for c in range(3)] + [4 * cells(np.hypot(gx, gy)), 2 * spread(g)]))
+        return np.stack(out).astype(np.float32)
 
     def embed(self, images):
         feats = []
@@ -308,6 +362,33 @@ class HFVisionEmbedder(BaseEmbedder):
             v = h[:, 0] if h.dim() == 3 else h.mean(dim=(2, 3))
         return v.flatten(1).float().cpu().numpy()
 
+    supports_spatial = True
+
+    def _side(self) -> int:
+        cs = getattr(self.processor, "crop_size", None)
+        if isinstance(cs, dict) and cs.get("height"):
+            return int(cs["height"])
+        sz = getattr(self.processor, "size", None)
+        if isinstance(sz, dict):
+            return int(sz.get("height") or sz.get("shortest_edge") or 224)
+        return 224
+
+    def embed_spatial(self, images):
+        side = self._side()   # whole image resized to the model's input, no centre crop -> map covers it all
+        ims = [i.convert("RGB").resize((side, side), Image.BICUBIC) for i in images]
+        try:
+            inputs = self.processor(images=ims, return_tensors="pt", do_resize=False, do_center_crop=False)
+        except Exception:
+            inputs = self.processor(images=ims, return_tensors="pt")
+        with self.torch.no_grad():
+            h = self.model(**inputs.to(self.device)).last_hidden_state
+        if h.dim() == 4:                       # CNN: (N, C, h, w)
+            return h.float().cpu().numpy()
+        tok = h[:, 1:]                         # ViT: drop CLS, keep the last g*g patch tokens (skips registers)
+        g = math.isqrt(tok.shape[1])
+        tok = tok[:, tok.shape[1] - g * g:]
+        return tok.reshape(len(ims), g, g, -1).permute(0, 3, 1, 2).float().cpu().numpy()
+
 
 class HFClipEmbedder(BaseEmbedder):
     """CLIP / SigLIP: image embeddings plus text embeddings in the same space (enables text search)."""
@@ -350,12 +431,16 @@ class CustomEmbedder(BaseEmbedder):
             self.obj = mod.Embedder()
         self.name = getattr(self.obj, "name", os.path.basename(path))
         self.supports_text = hasattr(self.obj, "embed_text")
+        self.supports_spatial = hasattr(self.obj, "embed_spatial")
 
     def embed(self, images):
         return np.asarray(self.obj.embed(images), dtype=np.float32)
 
     def embed_text(self, texts):
         return np.asarray(self.obj.embed_text(texts), dtype=np.float32)
+
+    def embed_spatial(self, images):
+        return np.asarray(self.obj.embed_spatial(images), dtype=np.float32)
 
 
 # --------------------------------------------------------------------------- factory
@@ -504,6 +589,68 @@ def search(X, q, top=12):
     return order, sims[order]
 
 
+def spatial_difference(Fa, Fb, aligned=True):
+    """Per-location difference (1 - cosine) between two (C, h, w) feature maps.
+    aligned: compare the same position in both images.
+    not aligned: each location is compared with its best match anywhere in the other image."""
+    C = Fa.shape[0]
+    A, B = l2n(Fa.reshape(C, -1).T), l2n(Fb.reshape(C, -1).T)
+    if aligned and Fa.shape == Fb.shape:
+        sa = sb = (A * B).sum(1)
+    else:
+        S = A @ B.T
+        sa, sb = S.max(1), S.max(0)
+    return 1 - sa.reshape(Fa.shape[1:]), 1 - sb.reshape(Fb.shape[1:])
+
+
+def domain_separability(X, labels, seed=0):
+    """Held-out balanced accuracy of a linear classifier predicting the group from the embedding."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
+    labels = np.asarray(labels, dtype=object)
+    counts = Counter(labels)
+    if len(counts) < 2 or min(counts.values()) < 3:
+        return None
+    cv = StratifiedKFold(min(5, min(counts.values())), shuffle=True, random_state=seed)
+    s = cross_val_score(LogisticRegression(max_iter=3000), l2n(X), labels.astype(str), cv=cv,
+                        scoring="balanced_accuracy")
+    return float(s.mean())
+
+
+def pair_similarities(X, labels, max_pairs=30000, seed=0):
+    """Cosine similarities of image pairs, tagged 'within <group>' or '<a> ↔ <b>'."""
+    Xn, labels, n = l2n(X), np.asarray(labels, dtype=object), len(X)
+    if n * (n - 1) // 2 <= max_pairs:
+        I, J = np.triu_indices(n, 1)
+    else:
+        rng = np.random.default_rng(seed)
+        I, J = rng.integers(0, n, 2 * max_pairs), rng.integers(0, n, 2 * max_pairs)
+        keep = I != J
+        I, J = I[keep][:max_pairs], J[keep][:max_pairs]
+    sims = (Xn[I] * Xn[J]).sum(1)
+    kind = [f"within {a}" if a == b else " ↔ ".join(sorted((a, b))) for a, b in zip(labels[I], labels[J])]
+    return pd.DataFrame({"kind": kind, "similarity": sims})
+
+
+def ordered_groups(groups):
+    """Put a 'synthetic'-like group first so A = synthetic, B = real by default."""
+    return sorted(groups, key=lambda g: (0 if "syn" in str(g).lower() else 1, str(g)))
+
+
+def find_pairs(keys, groups):
+    """(i, j) index pairs of images with the same file stem in the two groups."""
+    gs = ordered_groups(set(groups))
+    if len(gs) != 2:
+        return []
+    by_key = defaultdict(dict)
+    for i, (k, g) in enumerate(zip(keys, groups)):
+        by_key[k].setdefault(g, i)
+    pairs = [(d[gs[0]], d[gs[1]]) for _, d in sorted(by_key.items()) if len(d) == 2]
+    if not pairs and all(list(groups).count(g) == 1 for g in gs):   # one image per group -> that's the pair
+        pairs = [(list(groups).index(gs[0]), list(groups).index(gs[1]))]
+    return pairs
+
+
 # ############################################################################
 # DEMO DATASET
 # ############################################################################
@@ -560,10 +707,32 @@ def make_demo_dataset(n_images=40, seed=0, noise_rate=0.06):
     return images, [("demo_part1.json", cocos[0]), ("demo_part2.json", cocos[1])]
 
 
+def make_domain_demo(n_pairs=12, seed=1):
+    """Synthetic renders + 'real' versions of the same scenes (blur, colour cast, noise, vignette,
+    JPEG, and in half of them an extra object). Pairs share a file stem."""
+    imgs, _ = make_demo_dataset(n_images=n_pairs, seed=seed, noise_rate=0)
+    rng, nrng = random.Random(seed), np.random.default_rng(seed)
+    out = []
+    for name, raw in imgs:
+        out.append(("synthetic", name, raw))
+        im = Image.open(io.BytesIO(raw)).convert("RGB").filter(ImageFilter.GaussianBlur(1.2))
+        a = np.asarray(im, np.float32) * np.array([1.08, 0.97, 0.88]) + nrng.normal(0, 9, (im.size[1], im.size[0], 3))
+        yy, xx = np.mgrid[0:im.size[1], 0:im.size[0]]
+        a *= (1 - 0.9 * ((xx / im.size[0] - 0.5) ** 2 + (yy / im.size[1] - 0.5) ** 2))[..., None]
+        im = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+        if rng.random() < 0.5:
+            x, y = rng.uniform(20, 260), rng.uniform(20, 190)
+            ImageDraw.Draw(im).ellipse([x, y, x + rng.uniform(30, 50), y + rng.uniform(20, 35)], fill=(95, 95, 100))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=70)
+        out.append(("real", name.rsplit(".", 1)[0] + ".jpg", buf.getvalue()))
+    return out
+
+
 # ############################################################################
 # TEMPLATE FOR YOUR OWN MODEL (offered as a download in the app)
 # ############################################################################
-CUSTOM_MODEL_TEMPLATE = '"""Template for plugging YOUR model into the Mask Embedding Explorer.\n\nRules:\n  * define a class called `Embedder`\n  * __init__(self, device) loads the model once\n  * embed(self, images) receives a list of PIL RGB crops and returns a (N, D) numpy array\n  * optional: embed_text(self, texts) -> (N, D) array in the same space (enables text search)\n\nTip for segmentation models (Mask R-CNN, Mask2Former, SAM, a U-Net...):\nuse the model\'s backbone / encoder as the feature extractor and global-average-pool its\nlast feature map. That shows you how *your* model sees the masks.\n"""\nimport numpy as np\nimport torch\nimport torchvision\nfrom torchvision import transforms\n\n\nclass Embedder:\n    name = "My model (ResNet-18 example)"\n\n    def __init__(self, device="cpu"):\n        self.device = device\n        # ---- replace this block with your own model -------------------------------\n        # self.model = MyNet(num_classes=...)\n        # self.model.load_state_dict(torch.load("weights.pth", map_location=device))\n        # self.model.head = torch.nn.Identity()          # drop the classifier\n        self.model = torchvision.models.resnet18(weights="DEFAULT")\n        self.model.fc = torch.nn.Identity()\n        # ---------------------------------------------------------------------------\n        self.model.to(device).eval()\n        self.transform = transforms.Compose([\n            transforms.Resize((224, 224)),\n            transforms.ToTensor(),\n            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),\n        ])\n\n    @torch.no_grad()\n    def embed(self, images):\n        batch = torch.stack([self.transform(im.convert("RGB")) for im in images]).to(self.device)\n        feats = self.model(batch)\n        return feats.flatten(1).cpu().numpy().astype(np.float32)\n'
+CUSTOM_MODEL_TEMPLATE = '"""Template for plugging YOUR model into the Mask Embedding Explorer.\n\nRules:\n  * define a class called `Embedder`\n  * __init__(self, device) loads the model once\n  * embed(self, images) receives a list of PIL RGB crops and returns a (N, D) numpy array\n  * optional: embed_text(self, texts) -> (N, D) array in the same space (enables text search)\n  * optional: embed_spatial(self, images) -> (N, C, h, w) feature maps (enables the difference\n    heatmaps in Whole images mode)\n\nTip for segmentation models (Mask R-CNN, Mask2Former, SAM, a U-Net...):\nuse the model\'s backbone / encoder as the feature extractor and global-average-pool its\nlast feature map. That shows you how *your* model sees the masks.\n"""\nimport numpy as np\nimport torch\nimport torchvision\nfrom torchvision import transforms\n\n\nclass Embedder:\n    name = "My model (ResNet-18 example)"\n\n    def __init__(self, device="cpu"):\n        self.device = device\n        # ---- replace this block with your own model -------------------------------\n        # self.model = MyNet(num_classes=...)\n        # self.model.load_state_dict(torch.load("weights.pth", map_location=device))\n        # self.model.head = torch.nn.Identity()          # drop the classifier\n        self.model = torchvision.models.resnet18(weights="DEFAULT")\n        self.model.fc = torch.nn.Identity()\n        # ---------------------------------------------------------------------------\n        self.model.to(device).eval()\n        self.transform = transforms.Compose([\n            transforms.Resize((224, 224)),\n            transforms.ToTensor(),\n            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),\n        ])\n\n    @torch.no_grad()\n    def embed(self, images):\n        batch = torch.stack([self.transform(im.convert("RGB")) for im in images]).to(self.device)\n        feats = self.model(batch)\n        return feats.flatten(1).cpu().numpy().astype(np.float32)\n'
 
 
 # ############################################################################
@@ -613,6 +782,22 @@ def scan_folder(folder: str):
 
 
 @st.cache_data(show_spinner=False)
+def scan_groups(folder: str):
+    """(group, relative path, full path) for every image; the first subfolder is the group."""
+    root, out = Path(folder).expanduser(), []
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+            rel = p.relative_to(root)
+            out.append((rel.parts[0] if len(rel.parts) > 1 else root.name, str(rel), str(p)))
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def domain_demo(n):
+    return make_domain_demo(n_pairs=n)
+
+
+@st.cache_data(show_spinner=False)
 def demo_dataset(n):
     return make_demo_dataset(n_images=n)
 
@@ -644,6 +829,8 @@ APP_DIR = Path(__file__).resolve().parent
 LOCAL_EMBEDDERS = sorted(str(p) for p in APP_DIR.glob("*_embedder.py"))
 DATA_IMAGES, DATA_ANNS = APP_DIR / "data" / "images", APP_DIR / "data" / "annotations"
 HAS_LOCAL_DATA = DATA_IMAGES.is_dir() and DATA_ANNS.is_dir()
+DATA_COMPARE = APP_DIR / "data" / "compare"
+HAS_COMPARE_DATA = DATA_COMPARE.is_dir() and any(p.is_dir() for p in DATA_COMPARE.iterdir())
 
 
 def select_one(i):
@@ -656,85 +843,126 @@ def select_group(idxs):
 
 # =========================================================================== sidebar: data
 st.sidebar.markdown("## 🧩 Mask Embedding Explorer")
+mode = st.sidebar.radio("What do you want to embed?", ["Masks (COCO)", "Whole images"], horizontal=True,
+                        help="Masks: one embedding per COCO annotation. Whole images: one embedding per image, "
+                             "no COCO files needed — e.g. to compare synthetic and real images.")
+IMG_MODE = mode == "Whole images"
+UNIT = "images" if IMG_MODE else "masks"
 images: dict = {}
 records: list = []
 coco_names: list = []
 problems_in: list = []
 dup_images: list = []
 
-with st.sidebar.expander("① Images & COCO files", expanded=ss.result is None):
-    source = st.radio("Where are your files?", ["Upload", "Local folder", "Demo"], horizontal=True,
-                      index=1 if HAS_LOCAL_DATA else 0,
-                      help="Local folder is best for large datasets (no upload size limit).")
-    if source == "Upload":
-        up_imgs = st.file_uploader("Images", type=[e.strip(".") for e in IMAGE_EXTS], accept_multiple_files=True)
-        up_cocos = st.file_uploader("COCO files (.json) — one file may cover many images", type=["json"],
-                                    accept_multiple_files=True)
-        for f in up_imgs or []:
-            k = image_key(f.name)
-            if k in images:
-                dup_images.append(f.name)
-            images[k] = f.getvalue()
-        for f in up_cocos or []:
-            try:
-                recs, _ = parse_coco_bytes(f.getvalue(), f.name)
-                records += recs
-                coco_names.append(f.name)
-            except Exception as e:
-                problems_in.append(f"{f.name}: {e}")
-    elif source == "Local folder":
-        folder = st.text_input("Images folder (searched recursively)", str(DATA_IMAGES) if HAS_LOCAL_DATA else "",
-                               placeholder="/data/project/images")
-        coco_txt = st.text_area("COCO files or folders, one per line", str(DATA_ANNS) if HAS_LOCAL_DATA else "",
-                                placeholder="/data/project/annotations")
-        if folder:
-            if os.path.isdir(os.path.expanduser(folder)):
-                found, dup_images = scan_folder(folder)
-                images = dict(found)
-            else:
-                problems_in.append(f"Folder not found: {folder}")
-        for line in [l.strip() for l in coco_txt.splitlines() if l.strip()]:
-            p = Path(line).expanduser()
-            paths = sorted(p.rglob("*.json")) if p.is_dir() else [p]
-            for jp in paths:
+if IMG_MODE:
+    with st.sidebar.expander("① Images to compare", expanded=ss.result is None):
+        isource = st.radio("Where are your images?", ["Upload", "Local folder", "Demo"], horizontal=True,
+                           index=1 if HAS_COMPARE_DATA else 0, key="img_source")
+        found_items: dict = {}
+        if isource == "Upload":
+            for slot, default in (("A", "synthetic"), ("B", "real")):
+                gname = st.text_input(f"Group {slot} name", default, key=f"gname_{slot}").strip() or slot
+                for f in st.file_uploader(f"{gname} images", type=[e.strip(".") for e in IMAGE_EXTS],
+                                          accept_multiple_files=True, key=f"up_{slot}") or []:
+                    found_items[f"{gname}/{f.name}"] = ImageItem(f"{gname}/{f.name}", f.name, gname,
+                                                                 image_key(f.name), f.getvalue())
+        elif isource == "Local folder":
+            cfolder = st.text_input("Folder with one subfolder per group",
+                                    str(DATA_COMPARE) if HAS_COMPARE_DATA else "", placeholder=".../data/compare")
+            st.caption("For example `compare/synthetic/…` and `compare/real/…`: each subfolder becomes a group.")
+            if cfolder:
+                if os.path.isdir(os.path.expanduser(cfolder)):
+                    for g, rel, path in scan_groups(cfolder):
+                        found_items[f"{g}/{rel}"] = ImageItem(f"{g}/{rel}", Path(rel).name, g, image_key(rel), path)
+                else:
+                    problems_in.append(f"Folder not found: {cfolder}")
+        else:
+            n_pairs = st.slider("Demo image pairs", 4, 40, 12, 2)
+            st.caption("Rendered scenes (synthetic) and the same scenes with blur, noise, a colour cast and "
+                       "sometimes an extra object (real). Each pair shares a file name.")
+            for g, name, raw in domain_demo(n_pairs):
+                found_items[f"{g}/{name}"] = ImageItem(f"{g}/{name}", name, g, image_key(name), raw)
+        items = list(found_items.values())
+        all_groups = ordered_groups({it.group for it in items})
+        if items:
+            st.divider()
+            gsel = st.multiselect("Groups to include", all_groups, default=all_groups)
+            items = [it for it in items if it.group in gsel]
+    selected, matched, all_cats = items, [], ordered_groups({it.group for it in items})
+else:
+    with st.sidebar.expander("① Images & COCO files", expanded=ss.result is None):
+        source = st.radio("Where are your files?", ["Upload", "Local folder", "Demo"], horizontal=True,
+                          index=1 if HAS_LOCAL_DATA else 0,
+                          help="Local folder is best for large datasets (no upload size limit).")
+        if source == "Upload":
+            up_imgs = st.file_uploader("Images", type=[e.strip(".") for e in IMAGE_EXTS], accept_multiple_files=True)
+            up_cocos = st.file_uploader("COCO files (.json) — one file may cover many images", type=["json"],
+                                        accept_multiple_files=True)
+            for f in up_imgs or []:
+                k = image_key(f.name)
+                if k in images:
+                    dup_images.append(f.name)
+                images[k] = f.getvalue()
+            for f in up_cocos or []:
                 try:
-                    recs, _ = parse_coco_bytes(jp.read_bytes(), jp.name)
+                    recs, _ = parse_coco_bytes(f.getvalue(), f.name)
                     records += recs
-                    coco_names.append(jp.name)
+                    coco_names.append(f.name)
                 except Exception as e:
-                    problems_in.append(f"{jp}: {e}")
-    else:
-        n_demo = st.slider("Demo images", 10, 150, 40, 10)
-        st.caption("Coloured shapes in two COCO files. About 6% of the labels are deliberately wrong — "
-                   "see if the Label quality tab finds them.")
-        demo_imgs, demo_cocos = demo_dataset(n_demo)
-        images = {image_key(n): b for n, b in demo_imgs}
-        for name, coco in demo_cocos:
-            recs, _ = parse_coco_bytes(json.dumps(coco).encode(), name)
-            records += recs
-            coco_names.append(name)
+                    problems_in.append(f"{f.name}: {e}")
+        elif source == "Local folder":
+            folder = st.text_input("Images folder (searched recursively)", str(DATA_IMAGES) if HAS_LOCAL_DATA else "",
+                                   placeholder="/data/project/images")
+            coco_txt = st.text_area("COCO files or folders, one per line", str(DATA_ANNS) if HAS_LOCAL_DATA else "",
+                                    placeholder="/data/project/annotations")
+            if folder:
+                if os.path.isdir(os.path.expanduser(folder)):
+                    found, dup_images = scan_folder(folder)
+                    images = dict(found)
+                else:
+                    problems_in.append(f"Folder not found: {folder}")
+            for line in [l.strip() for l in coco_txt.splitlines() if l.strip()]:
+                p = Path(line).expanduser()
+                paths = sorted(p.rglob("*.json")) if p.is_dir() else [p]
+                for jp in paths:
+                    try:
+                        recs, _ = parse_coco_bytes(jp.read_bytes(), jp.name)
+                        records += recs
+                        coco_names.append(jp.name)
+                    except Exception as e:
+                        problems_in.append(f"{jp}: {e}")
+        else:
+            n_demo = st.slider("Demo images", 10, 150, 40, 10)
+            st.caption("Coloured shapes in two COCO files. About 6% of the labels are deliberately wrong — "
+                       "see if the Label quality tab finds them.")
+            demo_imgs, demo_cocos = demo_dataset(n_demo)
+            images = {image_key(n): b for n, b in demo_imgs}
+            for name, coco in demo_cocos:
+                recs, _ = parse_coco_bytes(json.dumps(coco).encode(), name)
+                records += recs
+                coco_names.append(name)
 
-    matched = [r for r in records if r.image_key in images]
-    all_cats = sorted({r.category for r in matched})
-    selected: list = []
-    if matched:
-        st.divider()
-        cats_sel = st.multiselect("Classes to include", all_cats, default=all_cats)
-        c1, c2 = st.columns(2)
-        min_area = c1.number_input("Min mask area (px²)", 0, value=0, step=50)
-        max_per = c2.number_input("Max masks per class", 0, value=0, step=100, help="0 = keep all. "
-                                  "Randomly subsamples big classes for speed and balance.")
-        skip_crowd = st.checkbox("Skip crowd annotations (iscrowd = 1)", True)
-        by_cat = defaultdict(list)
-        for r in matched:
-            if r.category in cats_sel and r.effective_area >= min_area and not (skip_crowd and r.iscrowd):
-                by_cat[r.category].append(r)
-        rng = np.random.default_rng(0)
-        for c in sorted(by_cat):
-            rs = by_cat[c]
-            if max_per and len(rs) > max_per:
-                rs = [rs[i] for i in sorted(rng.choice(len(rs), max_per, replace=False))]
-            selected += rs
+        matched = [r for r in records if r.image_key in images]
+        all_cats = sorted({r.category for r in matched})
+        selected: list = []
+        if matched:
+            st.divider()
+            cats_sel = st.multiselect("Classes to include", all_cats, default=all_cats)
+            c1, c2 = st.columns(2)
+            min_area = c1.number_input("Min mask area (px²)", 0, value=0, step=50)
+            max_per = c2.number_input("Max masks per class", 0, value=0, step=100, help="0 = keep all. "
+                                      "Randomly subsamples big classes for speed and balance.")
+            skip_crowd = st.checkbox("Skip crowd annotations (iscrowd = 1)", True)
+            by_cat = defaultdict(list)
+            for r in matched:
+                if r.category in cats_sel and r.effective_area >= min_area and not (skip_crowd and r.iscrowd):
+                    by_cat[r.category].append(r)
+            rng = np.random.default_rng(0)
+            for c in sorted(by_cat):
+                rs = by_cat[c]
+                if max_per and len(rs) > max_per:
+                    rs = [rs[i] for i in sorted(rng.choice(len(rs), max_per, replace=False))]
+                selected += rs
 
 # =========================================================================== sidebar: model + crop
 with st.sidebar.expander("② Embedding model", expanded=ss.result is None):
@@ -766,18 +994,20 @@ with st.sidebar.expander("② Embedding model", expanded=ss.result is None):
     device = c1.selectbox("Device", ["auto", "cuda", "mps", "cpu"])
     batch_size = c2.number_input("Batch size", 1, 256, 32)
 
-with st.sidebar.expander("③ Crop style"):
-    crop_mode = st.radio("What the model sees", ["masked", "bbox"],
-                         format_func=lambda m: {"masked": "Mask only (background filled)",
-                                                "bbox": "Bounding box (keeps background)"}[m])
-    pad = st.slider("Padding around the mask", 0, 100, 10, format="%d%%") / 100
-    square = st.checkbox("Pad to a square (no stretching)", True)
-    bg_hex = st.color_picker("Fill colour", "#7C7468", help="Default is close to the ImageNet mean colour.")
+crop_mode, pad, square, bg_hex = "masked", 0.1, True, "#7C7468"
+if not IMG_MODE:
+    with st.sidebar.expander("③ Crop style"):
+        crop_mode = st.radio("What the model sees", ["masked", "bbox"],
+                             format_func=lambda m: {"masked": "Mask only (background filled)",
+                                                    "bbox": "Bounding box (keeps background)"}[m])
+        pad = st.slider("Padding around the mask", 0, 100, 10, format="%d%%") / 100
+        square = st.checkbox("Pad to a square (no stretching)", True)
+        bg_hex = st.color_picker("Fill colour", "#7C7468", help="Default is close to the ImageNet mean colour.")
 crop_cfg = dict(mode=crop_mode, pad=pad, square=square, bg=hex_to_rgb(bg_hex))
 model_cfg = dict(backend=backend, model_id=model_id, pooling=pooling, custom_path=custom_path, device=device)
-settings_sig = json.dumps([model_cfg, crop_cfg, len(selected)], default=str)
+settings_sig = json.dumps([mode, model_cfg, crop_cfg, len(selected)], default=str)
 
-run_clicked = st.sidebar.button(f"🚀 Extract embeddings ({len(selected)} masks)", type="primary",
+run_clicked = st.sidebar.button(f"🚀 Extract embeddings ({len(selected)} {UNIT})", type="primary",
                                 width="stretch", disabled=not selected)
 
 
@@ -839,27 +1069,81 @@ def extract(selected, images, embedder, crop_cfg, batch_size):
     return keep, feats, thumbs, px_area, problems
 
 
+def extract_images(items, embedder, batch_size):
+    feats, thumbs, px_area, problems = {}, {}, {}, []
+    b_imgs, b_idx = [], []
+    bar = st.progress(0.0, text="Starting…")
+
+    def flush():
+        if not b_imgs:
+            return
+        V = np.asarray(embedder.embed(b_imgs), dtype=np.float32)
+        if V.ndim != 2 or len(V) != len(b_imgs):
+            raise ValueError(f"The model returned shape {V.shape} for {len(b_imgs)} images; expected (N, D).")
+        for j, v in zip(b_idx, V):
+            feats[j] = v
+        b_imgs.clear()
+        b_idx.clear()
+
+    for i, it in enumerate(items):
+        try:
+            img = load_image(it.src)
+        except Exception as e:
+            problems.append({"image": it.uid, "annotation": "", "problem": f"can't open image: {e}"})
+            continue
+        px_area[i] = img.size[0] * img.size[1]
+        th = img.copy()
+        th.thumbnail((THUMB, THUMB))
+        thumbs[i] = th
+        img.thumbnail((1024, 1024))
+        b_imgs.append(img)
+        b_idx.append(i)
+        if len(b_imgs) >= batch_size:
+            flush()
+        bar.progress((i + 1) / len(items), text=f"Embedding images… {i + 1}/{len(items)}")
+    flush()
+    bar.empty()
+    return sorted(feats), feats, thumbs, px_area, problems
+
+
 if run_clicked:
     try:
         embedder = load_embedder(**model_cfg)
-        keep, feats, thumbs, px_area, problems = extract(selected, images, embedder, crop_cfg, int(batch_size))
+        if IMG_MODE:
+            keep, feats, thumbs, px_area, problems = extract_images(selected, embedder, int(batch_size))
+        else:
+            keep, feats, thumbs, px_area, problems = extract(selected, images, embedder, crop_cfg, int(batch_size))
         if len(keep) < 2:
-            st.error("Fewer than 2 masks could be embedded. Check the problems listed below.")
+            st.error(f"Fewer than 2 {UNIT} could be embedded. Check the problems listed below.")
             st.dataframe(pd.DataFrame(problems))
         else:
             recs = [selected[i] for i in keep]
-            df = pd.DataFrame({
-                "idx": np.arange(len(keep)),
-                "category": [r.category for r in recs],
-                "image": [r.image_name for r in recs],
-                "coco_file": [r.coco_source for r in recs],
-                "ann_id": [str(r.ann_id) for r in recs],
-                "area_px": [px_area[i] for i in keep],
-                "uid": [r.uid for r in recs],
-            })
+            if IMG_MODE:
+                df = pd.DataFrame({
+                    "idx": np.arange(len(keep)),
+                    "category": [r.group for r in recs],
+                    "image": [r.name for r in recs],
+                    "coco_file": [r.group for r in recs],
+                    "ann_id": ["" for _ in recs],
+                    "area_px": [px_area[i] for i in keep],
+                    "uid": [r.uid for r in recs],
+                    "key": [r.key for r in recs],
+                })
+            else:
+                df = pd.DataFrame({
+                    "idx": np.arange(len(keep)),
+                    "category": [r.category for r in recs],
+                    "image": [r.image_name for r in recs],
+                    "coco_file": [r.coco_source for r in recs],
+                    "ann_id": [str(r.ann_id) for r in recs],
+                    "area_px": [px_area[i] for i in keep],
+                    "uid": [r.uid for r in recs],
+                })
             ss.result = dict(df=df, X=np.stack([feats[i] for i in keep]), thumbs=[thumbs[i] for i in keep],
                              records=recs, images=images, crop_cfg=crop_cfg, model_cfg=model_cfg,
                              model_name=embedder.name, supports_text=embedder.supports_text,
+                             supports_spatial=embedder.supports_spatial, spatial={},
+                             mode="images" if IMG_MODE else "masks",
                              problems=problems, sig=settings_sig, proj={}, ana={})
             ss.sel_idx, ss.sel_group, ss.last_sig, ss.overlay_cache = None, [], None, {}
             st.rerun()
@@ -869,6 +1153,37 @@ if run_clicked:
 res = ss.result
 
 # =========================================================================== landing page
+if res is None and IMG_MODE:
+    st.title("🧩 Compare whole images")
+    st.write("Add images in groups (for example **synthetic** and **real**), pick a model, then press "
+             "**Extract embeddings** to see how the model sees the difference. No COCO files needed.")
+    groups_now = ordered_groups({it.group for it in selected})
+    npairs = len(find_pairs([it.key for it in selected], [it.group for it in selected]))
+    m = st.columns(3)
+    m[0].metric("Images", len(selected))
+    m[1].metric("Groups", len(groups_now))
+    m[2].metric("Pairs (same file name)", npairs)
+    for p in problems_in:
+        st.error(p)
+    if not selected:
+        st.info("👈 Add images in the sidebar — or pick **Demo** to try it with generated synthetic/real pairs.")
+    elif len(groups_now) < 2:
+        st.warning("All images are in one group. Add a second group (e.g. real images) to compare.")
+    if selected:
+        cols = st.columns(max(1, len(groups_now)))
+        for c, g in zip(cols, groups_now):
+            members = [it for it in selected if it.group == g]
+            c.markdown(f"**{g}** — {len(members)} images")
+            sub = c.columns(3)
+            for n, it in enumerate(members[:6]):
+                try:
+                    th = load_image(it.src)
+                    th.thumbnail((256, 256))
+                    sub[n % 3].image(th, caption=it.name, width="stretch")
+                except Exception as e:
+                    sub[n % 3].warning(f"{it.name}: {e}")
+    st.stop()
+
 if res is None:
     st.title("🧩 Mask Embedding Explorer")
     st.write("Add images and their COCO files, pick a model, then press **Extract embeddings**. "
@@ -958,10 +1273,19 @@ df["outlier_z"] = A["cls"]["z"]
 df["suspicious"] = df["agreement"] < thr
 cats = sorted(df["category"].unique())
 CMAP = cat_colors(cats)
+IMG_RES = res.get("mode") == "images"
+RUNIT = "images" if IMG_RES else "masks"
+LBL = "group" if IMG_RES else "class"
 
 
 def get_overlay(i):
     uid = df.at[i, "uid"]
+    if IMG_RES and uid not in ss.overlay_cache:
+        img = load_image(res["records"][i].src)
+        img.thumbnail((1000, 1000))
+        if len(ss.overlay_cache) > 60:
+            ss.overlay_cache.pop(next(iter(ss.overlay_cache)))
+        ss.overlay_cache[uid] = img
     if uid not in ss.overlay_cache:
         r = res["records"][i]
         img = load_image(res["images"][r.image_key])
@@ -987,7 +1311,34 @@ def gallery(idxs, prefix, ncols=4, sims=None, ref_cat=None, limit=48):
             st.button("Inspect", key=f"{prefix}_{j}_{n}", on_click=select_one, args=(j,), width="stretch")
 
 
+def set_compare(slot, i):
+    ss[f"cmp_{slot}"] = int(i)
+
+
+def detail_image(i, prefix):
+    row = df.loc[i]
+    st.markdown(f"#### {row.category} · {row.image}")
+    if row.agreement < 0.5:
+        st.info(f"{1 - row.agreement:.0%} of its nearest neighbours are **{row.suggested}** images — "
+                f"the model sees this {row.category} image as close to that group.")
+    else:
+        st.success(f"{row.agreement:.0%} of its nearest neighbours are also {row.category} images.")
+    try:
+        st.image(get_overlay(i), width="stretch")
+    except Exception as e:
+        st.warning(f"Can't render the image: {e}")
+    c = st.columns(2)
+    c[0].button("Use as image A in ⚖️ Compare", key=f"{prefix}_ca_{i}", on_click=set_compare, args=("a", i),
+                width="stretch")
+    c[1].button("Use as image B in ⚖️ Compare", key=f"{prefix}_cb_{i}", on_click=set_compare, args=("b", i),
+                width="stretch")
+    st.markdown("**Most similar images**")
+    gallery(A["nbr_i"][i][:8], f"{prefix}nb{i}", sims=A["nbr_s"][i][:8], ref_cat=row.category)
+
+
 def detail(i, prefix):
+    if IMG_RES:
+        return detail_image(i, prefix)
     row = df.loc[i]
     st.markdown(f"#### {row.category}")
     if row.suspicious and row.suggested != row.category:
@@ -1009,7 +1360,7 @@ def detail(i, prefix):
 
 def group_panel(idxs, prefix):
     sub = df.loc[idxs]
-    st.markdown(f"#### {len(sub)} masks selected")
+    st.markdown(f"#### {len(sub)} {RUNIT} selected")
     cnt = sub["category"].value_counts().rename_axis("class").reset_index(name="masks")
     fig = px.bar(cnt, x="masks", y="class", orientation="h", color="class", color_discrete_map=CMAP,
                  height=max(160, 26 * len(cnt)))
@@ -1021,9 +1372,16 @@ def group_panel(idxs, prefix):
 
 
 # =========================================================================== tabs
-st.markdown(f"### 🧩 {len(df):,} masks · {len(cats)} classes · {res['model_name']}")
-t_map, t_quality, t_classes, t_search, t_export, t_info = st.tabs(
-    ["🗺️ Explorer", "🩺 Label quality", "📊 Classes", "🔎 Search", "💾 Export", "ℹ️ Run info"])
+LBL_N = LBL if len(cats) == 1 else ("groups" if IMG_RES else "classes")
+st.markdown(f"### 🧩 {len(df):,} {RUNIT} · {len(cats)} {LBL_N} · {res['model_name']}")
+if IMG_RES:
+    t_map, t_compare, t_classes, t_search, t_export, t_info = st.tabs(
+        ["🗺️ Explorer", "⚖️ Compare", "📊 Groups", "🔎 Search", "💾 Export", "ℹ️ Run info"])
+    t_quality = None
+else:
+    t_map, t_quality, t_classes, t_search, t_export, t_info = st.tabs(
+        ["🗺️ Explorer", "🩺 Label quality", "📊 Classes", "🔎 Search", "💾 Export", "ℹ️ Run info"])
+    t_compare = None
 
 # --------------------------------------------------------------------------- explorer
 with t_map:
@@ -1108,72 +1466,234 @@ with t_map:
             q[0].metric("kNN label accuracy", f"{(df.suggested == df.category).mean():.0%}",
                         help="How often a mask's neighbours vote for its own label — a quick measure of how well "
                              "this model separates your classes.")
-            q[1].metric("Suspicious masks", int(df.suspicious.sum()))
+            q[1].metric("Mixed neighbourhoods" if IMG_RES else "Suspicious masks", int(df.suspicious.sum()))
             q[2].metric("Embedding size", X.shape[1])
 
 # --------------------------------------------------------------------------- label quality
-with t_quality:
-    st.write("A mask whose nearest neighbours mostly carry a different label is often mislabelled, ambiguous "
-             "or badly segmented. Fixing these usually improves a model more than adding data.")
-    q = st.columns(4)
-    q[0].metric("kNN label accuracy", f"{(df.suggested == df.category).mean():.1%}")
-    q[1].metric("Suspicious (agreement < %.0f%%)" % (thr * 100), int(df.suspicious.sum()))
-    q[2].metric("Mean agreement", f"{df.agreement.mean():.2f}")
-    q[3].metric("Class outliers (z > 2.5)", int((df.outlier_z > 2.5).sum()))
+if t_quality is not None:
+    with t_quality:
+        st.write("A mask whose nearest neighbours mostly carry a different label is often mislabelled, ambiguous "
+                 "or badly segmented. Fixing these usually improves a model more than adding data.")
+        q = st.columns(4)
+        q[0].metric("kNN label accuracy", f"{(df.suggested == df.category).mean():.1%}")
+        q[1].metric("Suspicious (agreement < %.0f%%)" % (thr * 100), int(df.suspicious.sum()))
+        q[2].metric("Mean agreement", f"{df.agreement.mean():.2f}")
+        q[3].metric("Class outliers (z > 2.5)", int((df.outlier_z > 2.5).sum()))
 
-    st.markdown("##### Possible label errors")
-    flagged = df[df.suspicious].sort_values("agreement").head(300)
-    if flagged.empty:
-        st.success("Nothing below the threshold. Raise it in ④ Map & analysis to be stricter.")
-    else:
-        table = pd.DataFrame({
-            "crop": [data_uri(res["thumbs"][j]) for j in flagged.idx],
-            "label": flagged.category.values, "neighbours say": flagged.suggested.values,
-            "agreement": flagged.agreement.values, "image": flagged.image.values,
-            "annotation": flagged.ann_id.values})
-        ev = st.dataframe(table, hide_index=True, width="stretch", height=380, on_select="rerun",
-                          selection_mode="single-row", key="flag_table",
-                          column_config={"crop": st.column_config.ImageColumn("Crop", width="small"),
-                                         "agreement": st.column_config.ProgressColumn(
-                                             "Agreement", min_value=0.0, max_value=1.0, format="%.2f")})
-        rows = ev.selection.rows if ev is not None else []
-        if rows:
-            st.divider()
-            detail(int(flagged.idx.iloc[rows[0]]), "qual")
+        st.markdown("##### Possible label errors")
+        flagged = df[df.suspicious].sort_values("agreement").head(300)
+        if flagged.empty:
+            st.success("Nothing below the threshold. Raise it in ④ Map & analysis to be stricter.")
         else:
-            st.caption("Select a row to inspect it here.")
+            table = pd.DataFrame({
+                "crop": [data_uri(res["thumbs"][j]) for j in flagged.idx],
+                "label": flagged.category.values, "neighbours say": flagged.suggested.values,
+                "agreement": flagged.agreement.values, "image": flagged.image.values,
+                "annotation": flagged.ann_id.values})
+            ev = st.dataframe(table, hide_index=True, width="stretch", height=380, on_select="rerun",
+                              selection_mode="single-row", key="flag_table",
+                              column_config={"crop": st.column_config.ImageColumn("Crop", width="small"),
+                                             "agreement": st.column_config.ProgressColumn(
+                                                 "Agreement", min_value=0.0, max_value=1.0, format="%.2f")})
+            rows = ev.selection.rows if ev is not None else []
+            if rows:
+                st.divider()
+                detail(int(flagged.idx.iloc[rows[0]]), "qual")
+            else:
+                st.caption("Select a row to inspect it here.")
 
-    st.markdown("##### Far from their own class")
-    st.caption("Masks that are unusually far from their class centre: rare poses, occlusion, bad crops or wrong labels.")
-    far = df.sort_values("outlier_z", ascending=False).head(12)
-    gallery(far.idx, "far", ncols=6, limit=12)
+        st.markdown("##### Far from their own class")
+        st.caption("Masks that are unusually far from their class centre: rare poses, occlusion, bad crops or wrong labels.")
+        far = df.sort_values("outlier_z", ascending=False).head(12)
+        gallery(far.idx, "far", ncols=6, limit=12)
 
-    st.markdown("##### Near-duplicates")
-    dthr = st.slider("Similarity threshold", 0.80, 1.00, 0.97, 0.005)
-    dups = near_duplicates(A["nbr_i"], A["nbr_s"], dthr)
-    st.caption(f"{len(dups)} pairs. Duplicates across train/test splits inflate your metrics; "
-               "duplicates with different labels are contradictions.")
-    for a_, b_, s in dups[:12]:
-        c = st.columns([1, 1, 3])
-        c[0].image(res["thumbs"][a_], width="stretch")
-        c[1].image(res["thumbs"][b_], width="stretch")
-        same_lbl = df.at[a_, "category"] == df.at[b_, "category"]
-        c[2].markdown(f"**{s:.3f}** similarity  \n{df.at[a_, 'image']} ↔ {df.at[b_, 'image']}  \n"
-                      + ("same label" if same_lbl else
-                         f"⚠️ different labels: {df.at[a_, 'category']} vs {df.at[b_, 'category']}"))
+        st.markdown("##### Near-duplicates")
+        dthr = st.slider("Similarity threshold", 0.80, 1.00, 0.97, 0.005)
+        dups = near_duplicates(A["nbr_i"], A["nbr_s"], dthr)
+        st.caption(f"{len(dups)} pairs. Duplicates across train/test splits inflate your metrics; "
+                   "duplicates with different labels are contradictions.")
+        for a_, b_, s in dups[:12]:
+            c = st.columns([1, 1, 3])
+            c[0].image(res["thumbs"][a_], width="stretch")
+            c[1].image(res["thumbs"][b_], width="stretch")
+            same_lbl = df.at[a_, "category"] == df.at[b_, "category"]
+            c[2].markdown(f"**{s:.3f}** similarity  \n{df.at[a_, 'image']} ↔ {df.at[b_, 'image']}  \n"
+                          + ("same label" if same_lbl else
+                             f"⚠️ different labels: {df.at[a_, 'category']} vs {df.at[b_, 'category']}"))
+
+
+# --------------------------------------------------------------------------- compare (whole images)
+if t_compare is not None:
+    with t_compare:
+        groups = ordered_groups(cats)
+        Xn = l2n(X)
+        pairs = find_pairs(df["key"].tolist(), df["category"].tolist())
+        opts = df["idx"].tolist()
+        fmt = lambda j: f"{df.at[j, 'category']} · {df.at[j, 'image']}"   # noqa: E731
+
+        if "pairsims" not in res:
+            res["pairsims"] = pair_similarities(X, df["category"].values)
+        psims = res["pairsims"]
+        cross = psims[~psims["kind"].str.startswith("within")]["similarity"].values
+
+        # ---- matching pairs table (same file name in both groups)
+        if pairs:
+            pdf = pd.DataFrame({"a": [p[0] for p in pairs], "b": [p[1] for p in pairs]})
+            pdf["similarity"] = [float(Xn[a] @ Xn[b]) for a, b in pairs]
+            pdf = pdf.sort_values("similarity").reset_index(drop=True)
+            st.markdown(f"##### {len(pdf)} matching pair{'s' if len(pdf) != 1 else ''}")
+            if len(pdf) > 1:
+                st.caption("Same file name in both groups, sorted with the biggest difference first. "
+                           "Select a row to compare that pair below.")
+                table = pd.DataFrame({
+                    groups[0]: [data_uri(res["thumbs"][a]) for a in pdf.a],
+                    groups[1]: [data_uri(res["thumbs"][b]) for b in pdf.b],
+                    "file": [df.at[a, "image"] for a in pdf.a],
+                    "similarity": pdf.similarity.values})
+                pev = st.dataframe(table, hide_index=True, width="stretch", height=min(420, 60 + 56 * len(table)),
+                                   on_select="rerun", selection_mode="single-row", key="pair_table", row_height=52,
+                                   column_config={groups[0]: st.column_config.ImageColumn(groups[0], width="small"),
+                                                  groups[1]: st.column_config.ImageColumn(groups[1], width="small"),
+                                                  "similarity": st.column_config.ProgressColumn(
+                                                      "Similarity", min_value=0.0, max_value=1.0, format="%.3f")})
+                rows = pev.selection.rows if pev is not None else []
+                psig = tuple(rows)
+                if rows and psig != ss.get("last_pair_sig"):
+                    ss.cmp_a, ss.cmp_b = int(pdf.a.iloc[rows[0]]), int(pdf.b.iloc[rows[0]])
+                ss.last_pair_sig = psig
+
+        # ---- choose the two images
+        if ss.get("cmp_a") not in opts:
+            ss.cmp_a = pairs[0][0] if pairs else int(df[df.category == groups[0]].idx.iloc[0])
+        if ss.get("cmp_b") not in opts:
+            second = df[df.category == groups[1]] if len(groups) > 1 else df[df.idx != ss.cmp_a]
+            ss.cmp_b = pairs[0][1] if pairs else int(second.idx.iloc[0])
+        st.markdown("##### Compare two images")
+        c = st.columns(2)
+        a = c[0].selectbox("Image A", opts, format_func=fmt, key="cmp_a")
+        b = c[1].selectbox("Image B", opts, format_func=fmt, key="cmp_b")
+
+        sim = float(Xn[a] @ Xn[b])
+        m = st.columns(3)
+        m[0].metric("Similarity to the model", f"{sim:.3f}",
+                    help="Cosine similarity of the two embeddings: 1 = identical to the model, 0 = unrelated.")
+        m[1].metric("Difference", f"{1 - sim:.3f}", help="1 − similarity.")
+        if len(cross) >= 5 and df.at[a, "category"] != df.at[b, "category"]:
+            m[2].metric("More similar than", f"{(cross < sim).mean():.0%}",
+                        help="Share of all cross-group image pairs that are less similar than this pair.")
+        else:
+            m[2].metric("Embedding size", X.shape[1])
+
+        # ---- where the model sees the difference
+        imgA, imgB = load_image(res["records"][a].src), load_image(res["records"][b].src)
+        spatial_err = None
+        if res.get("supports_spatial"):
+            hc = st.columns([1.4, 1])
+            how = hc[0].radio("Difference heatmap", ["Same position", "Best match anywhere"], horizontal=True,
+                              help="Same position: compares each region with the same region in the other image — "
+                                   "use it when both images show the same scene from the same viewpoint. "
+                                   "Best match anywhere: compares each region with its most similar region in the "
+                                   "other image — use it when the images aren't aligned.")
+            alpha = hc[1].slider("Heatmap opacity", 0.0, 1.0, 0.55, 0.05)
+            try:
+                emb = load_embedder(**res["model_cfg"])
+                for j, im in ((a, imgA), (b, imgB)):
+                    if j not in res["spatial"]:
+                        res["spatial"][j] = emb.embed_spatial([im])[0]
+                Fa, Fb = res["spatial"][a], res["spatial"][b]
+                da, db = spatial_difference(Fa, Fb, aligned=(how == "Same position"))
+                vmax = float(max(da.max(), db.max(), 1e-6))
+                c = st.columns(2)
+                c[0].image(heat_overlay(imgA, da, vmax, alpha), caption=f"A · {fmt(a)}", width="stretch")
+                c[1].image(heat_overlay(imgB, db, vmax, alpha), caption=f"B · {fmt(b)}", width="stretch")
+                lc = st.columns([1, 2])
+                lc[0].image(colorbar(), width="stretch")
+                lc[0].caption(f"same  ←  →  different (0 – {vmax:.2f})")
+                lc[1].caption(f"Each region is coloured by how differently the model represents it in the two images "
+                              f"(1 − cosine similarity of the model's internal features, on a {Fa.shape[1]}×{Fa.shape[2]} "
+                              f"grid). Bright regions are what the model 'sees' as different. "
+                              f"Average difference: A {da.mean():.3f} · B {db.mean():.3f}.")
+            except Exception as e:
+                spatial_err = str(e)
+        if not res.get("supports_spatial") or spatial_err:
+            c = st.columns(2)
+            c[0].image(imgA, caption=f"A · {fmt(a)}", width="stretch")
+            c[1].image(imgB, caption=f"B · {fmt(b)}", width="stretch")
+            st.info("Difference heatmaps need the model's spatial feature maps. "
+                    + (f"They failed for this model: {spatial_err}" if spatial_err else
+                       "This model doesn't provide them (CLIP doesn't; DINOv2, ResNet and c2t_embedder.py do). "
+                       "For your own model, add an `embed_spatial(images)` method returning (N, C, h, w)."))
+
+        # ---- group level
+        st.divider()
+        counts = df["category"].value_counts()
+        if len(groups) < 2:
+            st.info("Add a second group of images to compare groups.")
+        elif counts.min() < 3:
+            st.info("Add at least 3 images per group to see group-level results: how well the model separates "
+                    "the groups, similarity distributions, and which images look most like the other group.")
+        else:
+            g0, g1 = groups[0], groups[1]
+            st.markdown(f"##### {g0} vs {g1}: the overall picture")
+            if "sep" not in res:
+                res["sep"] = domain_separability(X, df["category"].values)
+            acc = res["sep"]
+            ci = {c_: i for i, c_ in enumerate(A["cls"]["classes"])}
+            csim = float(A["cls"]["sim"][ci[g0], ci[g1]])
+            mix = float((1 - df["agreement"]).mean())
+            m = st.columns(4)
+            m[0].metric("Model can tell them apart", f"{acc:.0%}" if acc is not None else "—",
+                        help="Balanced accuracy of a simple classifier that predicts the group from the embedding, "
+                             "tested on held-out images. ~50% = the groups look the same to the model; "
+                             "~100% = the model clearly separates them.")
+            m[1].metric("Group centre similarity", f"{csim:.3f}",
+                        help="Cosine similarity between the average embeddings of the groups.")
+            m[2].metric("Neighbours from the other group", f"{mix:.0%}",
+                        help="Average share of each image's nearest neighbours that belong to another group. "
+                             "Higher = the groups are mixed together.")
+            if pairs:
+                psim = np.array([float(Xn[p] @ Xn[q]) for p, q in pairs])
+                m[3].metric("Avg. similarity of matching pairs", f"{psim.mean():.3f}",
+                            help=f"For comparison, random {g0} ↔ {g1} pairs average {cross.mean():.3f}.")
+            if acc is not None:
+                if acc < 0.65:
+                    st.success(f"To this model, {g0} and {g1} images look alike: it can barely tell the groups apart.")
+                elif acc < 0.85:
+                    st.warning(f"The model partly separates {g0} from {g1} images: there is a noticeable gap.")
+                else:
+                    st.error(f"The model clearly separates {g0} from {g1} images: a large gap. "
+                             "The heatmaps above and the galleries below show where it comes from.")
+            fig = px.histogram(psims, x="similarity", color="kind", barmode="overlay", histnorm="probability density",
+                               nbins=50, opacity=0.55, height=320)
+            fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), legend=dict(title=None, orientation="h", y=1.12),
+                              yaxis_title=None, xaxis_title="similarity between two images")
+            st.plotly_chart(fig, width="stretch")
+            st.caption(f"If the {g0} ↔ {g1} curve sits to the left of the 'within' curves, the model treats the "
+                       "groups as different. If the curves overlap, it treats them the same.")
+            C = A["cls"]["centroids"]
+            for g, other in ((g0, g1), (g1, g0)):
+                members = df[df.category == g].copy()
+                members["to_other"] = Xn[members.idx.values] @ C[ci[other]]
+                st.markdown(f"**{g} images that look most like {other}**")
+                top = members.sort_values("to_other", ascending=False).head(6)
+                gallery(top.idx, f"cmpmost_{g}", ncols=6, sims=top.to_other.values, limit=6)
+                st.markdown(f"**{g} images that look least like {other}**")
+                bot = members.sort_values("to_other").head(6)
+                gallery(bot.idx, f"cmpleast_{g}", ncols=6, sims=bot.to_other.values, limit=6)
+            st.caption(f"Numbers = similarity to the average {LBL} embedding of the other group.")
 
 # --------------------------------------------------------------------------- classes
 with t_classes:
     cls = A["cls"]
     summary = pd.DataFrame({
-        "class": cats,
+        LBL: cats,
         "masks": [int((df.category == c).sum()) for c in cats],
         "kNN recall": [float((df.suggested[df.category == c] == c).mean()) for c in cats],
         "mean agreement": [float(df.agreement[df.category == c].mean()) for c in cats],
         "silhouette": [A["sil"].get(c, np.nan) for c in cats],
         "spread": [cls["spread"][c] for c in cats],
     })
-    st.markdown("##### How well each class separates")
+    st.markdown(f"##### How well each {LBL} separates")
     st.dataframe(summary, hide_index=True, width="stretch", column_config={
         "kNN recall": st.column_config.ProgressColumn(min_value=0.0, max_value=1.0, format="%.2f"),
         "mean agreement": st.column_config.ProgressColumn(min_value=0.0, max_value=1.0, format="%.2f"),
@@ -1199,7 +1719,7 @@ with t_classes:
                           yaxis_title="label")
         st.plotly_chart(fig, width="stretch")
     st.markdown("##### Typical vs unusual members")
-    ccls = st.selectbox("Class", cats)
+    ccls = st.selectbox(LBL.capitalize(), cats)
     members = df[df.category == ccls].assign(d=cls["dist"][df.category == ccls]).sort_values("d")
     st.caption("Closest to the class centre")
     gallery(members.idx.head(6), "typ", ncols=6, limit=6)
@@ -1262,13 +1782,14 @@ with t_export:
 # --------------------------------------------------------------------------- run info
 with t_info:
     mc = res["model_cfg"]
+    crop_txt = ("whole images" if IMG_RES else f"{res['crop_cfg']['mode']}, padding {res['crop_cfg']['pad']:.0%}, "
+                f"square: {res['crop_cfg']['square']}")
     st.markdown(f"**Model:** {res['model_name']} ({mc['backend']}, pooling: {mc['pooling']}, "
                 f"device: {get_device(mc['device'])})  \n"
-                f"**Embedding size:** {X.shape[1]}  \n**Masks embedded:** {len(df):,}  \n"
-                f"**Crop:** {res['crop_cfg']['mode']}, padding {res['crop_cfg']['pad']:.0%}, "
-                f"square: {res['crop_cfg']['square']}")
+                f"**Embedding size:** {X.shape[1]}  \n**{RUNIT.capitalize()} embedded:** {len(df):,}  \n"
+                f"**Input:** {crop_txt}")
     if res["problems"]:
         st.markdown(f"**{len(res['problems'])} issues while cropping**")
         st.dataframe(pd.DataFrame(res["problems"]), hide_index=True, width="stretch")
     else:
-        st.success("Every selected mask was embedded without issues.")
+        st.success(f"Every selected {RUNIT[:-1]} was embedded without issues.")

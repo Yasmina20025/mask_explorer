@@ -19,6 +19,8 @@ WEIGHTS = ""   # leave empty to search automatically (see _find_weights), or giv
 IMG_SIZE = 224                             # input size used in training
 MEAN = [0.485, 0.456, 0.406]               # normalisation used in training (ImageNet default)
 STD = [0.229, 0.224, 0.225]
+SPATIAL_SIZE = 448    # input size for the difference heatmaps in "Whole images" mode
+                      # (448 -> 14×14 grid; larger = finer heatmap, but slower)
 FEATURES = "pooled"   # "pooled": 2048-d vector just before the final layer (recommended)
                       # "output": the model's final output (class scores, or its own embedding head)
 # ------------------------------------------------------------------------------------------
@@ -127,6 +129,11 @@ class Embedder:
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
         ])
+        self.spatial_transform = transforms.Compose([
+            transforms.Resize((SPATIAL_SIZE, SPATIAL_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
         self.name = f"c2t_resnet50 ({FEATURES} features)"
         self.device = device
         try:                                    # some ops aren't supported on Apple GPUs (mps)
@@ -136,12 +143,14 @@ class Embedder:
             self.device = "cpu"
             self.model.to("cpu")
 
-    def _pooled(self, x):
+    def _feature_map(self, x):
         r = self.resnet
         act = getattr(r, "relu", None) or getattr(r, "act1")
         x = r.maxpool(act(r.bn1(r.conv1(x))))
-        x = r.layer4(r.layer3(r.layer2(r.layer1(x))))
-        return x.mean(dim=(2, 3))
+        return r.layer4(r.layer3(r.layer2(r.layer1(x))))          # (N, 2048, h, w)
+
+    def _pooled(self, x):
+        return self._feature_map(x).mean(dim=(2, 3))
 
     @torch.no_grad()
     def _forward(self, x):
@@ -155,6 +164,15 @@ class Embedder:
         batch = torch.stack([self.transform(im.convert(mode)) for im in images]).to(self.device)
         return self._forward(batch).float().cpu().numpy().astype(np.float32)
 
+    @torch.no_grad()
+    def embed_spatial(self, images):
+        """Feature maps (N, 2048, h, w) of the last ResNet stage, for the app's difference heatmaps."""
+        if self.resnet is None:
+            raise RuntimeError("No ResNet backbone found in this model, so spatial feature maps aren't available.")
+        mode = "L" if self.gray else "RGB"
+        batch = torch.stack([self.spatial_transform(im.convert(mode)) for im in images]).to(self.device)
+        return self._feature_map(batch).float().cpu().numpy().astype(np.float32)
+
 
 if __name__ == "__main__":
     from PIL import Image
@@ -166,4 +184,7 @@ if __name__ == "__main__":
     print(f"ResNet backbone found: {e.resnet is not None}   grayscale input: {e.gray}")
     v = e.embed([Image.new("RGB", (300, 200), (120, 90, 60)), Image.new("RGB", (64, 64), (10, 200, 30))])
     print(f"Embedding size: {v.shape[1]}  (FEATURES = '{FEATURES}')")
+    if e.resnet is not None:
+        sp = e.embed_spatial([Image.new("RGB", (300, 200), (120, 90, 60))])
+        print(f"Heatmap grid:   {sp.shape[2]}×{sp.shape[3]}  (SPATIAL_SIZE = {SPATIAL_SIZE})")
     print("Ready to use in the Mask Embedding Explorer.")

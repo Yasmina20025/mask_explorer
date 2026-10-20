@@ -6,12 +6,19 @@ Give it images and their COCO annotation files. It crops every mask, runs it thr
 each mask as a point on a 2-D map, so masks the model considers similar end up close together.
 Click any point to see the mask, where it sits in its image, and its most similar masks.
 
+It has two modes:
+
+- **Masks (COCO):** one embedding per annotated mask.
+- **Whole images:** one embedding per image, no COCO files needed. Use it, for example, to compare **synthetic and real images**
+  and see where the model sees the difference.
+
 Typical uses:
 
 - Check whether the model separates our classes, and which classes it confuses
 - Find **probably mislabelled annotations** (masks surrounded by masks of another class)
 - Find outliers, unusual examples and near-duplicate annotations
 - Search for masks similar to an example image
+- Measure the gap between synthetic and real images, and see which image regions cause it
 
 ---
 
@@ -23,8 +30,9 @@ Typical uses:
 4. [Adding your data](#adding-your-data)
 5. [Running the app](#running-the-app)
 6. [Using the dashboard](#using-the-dashboard)
-7. [Using a different model](#using-a-different-model)
-8. [Troubleshooting](#troubleshooting)
+7. [Comparing whole images (synthetic vs real)](#comparing-whole-images-synthetic-vs-real)
+8. [Using a different model](#using-a-different-model)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -43,8 +51,11 @@ mask_explorer/
 ├── requirements.txt     # Python packages
 ├── model/               # put c2t_resnet50.pt here (not stored in git)
 └── data/
-    ├── images/          # put your images here (not stored in git)
-    └── annotations/     # put your COCO .json files here (not stored in git)
+    ├── images/          # mask mode: your images (not stored in git)
+    ├── annotations/     # mask mode: your COCO .json files (not stored in git)
+    └── compare/         # whole-image mode: one subfolder per group (not stored in git)
+        ├── synthetic/
+        └── real/
 ```
 
 The model and data are **not** in the repository: the weights are too large for GitHub, and the data may be confidential.
@@ -123,6 +134,7 @@ Loaded:  ResNet-50 state dict, head: 2 outputs
 Device:  mps            (or cuda / cpu)
 ResNet backbone found: True   grayscale input: False
 Embedding size: 2048  (FEATURES = 'pooled')
+Heatmap grid:   14×14  (SPATIAL_SIZE = 448)
 Ready to use in the Mask Embedding Explorer.
 ```
 
@@ -145,6 +157,9 @@ Notes:
 
 You can also skip `data/` entirely and upload files in the app, or point the app to any folder on your computer.
 
+For **whole-image comparison**, see [Comparing whole images](#comparing-whole-images-synthetic-vs-real): it uses
+`data/compare/` and needs no COCO files.
+
 ---
 
 ## Running the app
@@ -159,8 +174,8 @@ python3 -m streamlit run app.py
 - The dashboard opens in your browser at **http://localhost:8501**. If it doesn't open, copy that address into the browser.
 - Keep the terminal open while you use the app. Press `Ctrl + C` in the terminal to stop it.
 
-To try the app without any model or data, choose **Demo** under *Images & COCO files* and
-**Quick test** under *Embedding model*.
+To try the app without any model or data, choose **Demo** as the data source and
+**Quick test** under *Embedding model*. Both modes have a demo.
 
 ---
 
@@ -170,6 +185,7 @@ To try the app without any model or data, choose **Demo** under *Images & COCO f
 
 | Section | What to do |
 |---|---|
+| **What do you want to embed?** | *Masks (COCO)* or *Whole images*. The rest of this section describes mask mode; whole-image mode is described [below](#comparing-whole-images-synthetic-vs-real). |
 | **① Images & COCO files** | Pre-filled with `data/images` and `data/annotations` when those folders exist. You can filter classes, ignore tiny masks, or cap the number of masks per class. |
 | **② Embedding model** | Pre-selected to *My own model* with `c2t_embedder.py`. Leave as is to use our model. |
 | **③ Crop style** | *Bounding box*: the model sees the object with its background. *Mask only*: the background is filled with a flat colour. Pick the one that matches how the model was trained. A preview shows exactly what the model will see. |
@@ -196,6 +212,56 @@ To try the app without any model or data, choose **Demo** under *Images & COCO f
 
 ---
 
+## Comparing whole images (synthetic vs real)
+
+Select **Whole images** at the top of the sidebar. Each image becomes one embedding, and **no COCO files are needed**.
+Only one thing matters: which group each image belongs to.
+
+### Adding the images
+
+**Option 1: folders** (recommended). Put the images in one subfolder per group:
+
+```
+data/compare/
+├── synthetic/     scene_01.png, scene_02.png, ...
+└── real/          scene_01.jpg, scene_02.jpg, ...
+```
+
+The app picks up `data/compare/` automatically; each subfolder becomes a group, whatever its name.
+You can also point it to any other folder with the same layout.
+
+**Option 2: upload.** The sidebar shows two upload boxes, *synthetic* and *real* by default. You can rename the groups.
+
+**Pairs.** A synthetic and a real image with the **same file name** (extension ignored, e.g. `scene_01.png` and
+`scene_01.jpg`) form a pair. If each group contains exactly one image, those two are paired automatically,
+so comparing just two images works too.
+
+Then press **🚀 Extract embeddings**.
+
+### The ⚖️ Compare tab
+
+- **Matching pairs:** all pairs, sorted with the biggest difference first. Select a row to compare that pair.
+- **Compare two images:** pick any image A and image B.
+  - *Similarity to the model*: cosine similarity of the two embeddings (1 = identical to the model, 0 = unrelated).
+  - *More similar than*: how this pair ranks among all synthetic ↔ real image pairs.
+- **Difference heatmap:** colours each region by how differently the model represents it in the two images
+  (dark = the same, bright = different).
+  - *Same position*: compares each region with the same region in the other image. Use it when both images show the same scene from the same viewpoint.
+  - *Best match anywhere*: compares each region with its most similar region in the other image. Use it when the images aren't aligned.
+- **The overall picture** (needs at least 3 images per group):
+  - *Model can tell them apart*: accuracy of a simple classifier that predicts synthetic vs real from the embeddings,
+    tested on held-out images. Around 50% means the groups look the same to the model; close to 100% means a clear gap.
+  - Similarity distributions within each group and across groups.
+  - The synthetic images that look **most** and **least** like real ones, and vice versa.
+
+The Explorer, Groups, Search and Export tabs work as in mask mode. In the Explorer, click an image and use
+*Use as image A/B in Compare* to send it to the Compare tab.
+
+> Note: the c2t model was trained on mask crops, so whole images are a different kind of input for it. The
+> comparison still shows how the model represents the two images, but it focuses on what it learned from crops.
+
+---
+
 ## Using a different model
 
 Choose a model under **② Embedding model**:
@@ -204,6 +270,10 @@ Choose a model under **② Embedding model**:
 - **Any Hugging Face model ID or local Hugging Face folder**
 - **Your own PyTorch model:** click *Download template* in the app, edit it to load your model, then select the file.
   Any file named `*_embedder.py` placed next to `app.py` is picked up automatically.
+  To get difference heatmaps in whole-image mode, also add an `embed_spatial(images)` method that returns the
+  model's feature maps as an array of shape (N, C, h, w).
+
+Heatmaps work with DINOv2, ResNet-50, any Hugging Face vision backbone, and `c2t_embedder.py`. CLIP doesn't provide them.
 
 ### Settings in `c2t_embedder.py`
 
@@ -215,6 +285,7 @@ Settings at the top of the file:
 | `IMG_SIZE` | `224` | Input size used in training |
 | `MEAN`, `STD` | ImageNet values | Normalisation used in training |
 | `FEATURES` | `"pooled"` | `"pooled"` = 2048-d features before the final layer (recommended). `"output"` = the model's final 2 outputs. |
+| `SPATIAL_SIZE` | `448` | Input size for the difference heatmaps: 448 gives a 14×14 grid. Larger = finer heatmap, but slower. |
 
 ---
 
@@ -231,3 +302,5 @@ Settings at the top of the file:
 | Port 8501 already in use | Another app is running. Stop it, or run `python3 -m streamlit run app.py --server.port 8502`. |
 | Uploading large files fails | Use the `data/` folders or *Local folder* instead, or start with `--server.maxUploadSize 4000` (MB). |
 | Extraction is slow | Lower *Max masks per class* in the sidebar, or run on a machine with a GPU. |
+| Whole-image mode shows only one group | Images must be inside subfolders of the compare folder (e.g. `data/compare/real/`), not directly in it. |
+| No heatmap in the Compare tab | The selected model doesn't provide spatial feature maps (e.g. CLIP). Use DINOv2, ResNet-50 or `c2t_embedder.py`. |
